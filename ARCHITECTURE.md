@@ -11,26 +11,37 @@ Implement in small vertical slices from `MVP_PLAN.md`. MVP1 should establish the
 ## Library layout
 
 ```text
-JournalLibrary/
-  Inbox/                 # files dropped here for discovery
-  Audio/<recording-id>/   # app-managed source audio
-  Transcripts/<recording-id>.json
-  Exports/<recording-id>.txt
-  app.sqlite
+%LOCALAPPDATA%/JournalTranscriber/Library/  # default on Windows; configurable with JOURNAL_LIBRARY_DIR
+  Audio/<recording-id>/<original-name>       # app-managed source audio
+  app.sqlite                                  # recording catalog and aliases
 ```
 
-Importing from the UI or inbox copies the source into the managed library by default. Preserve its original filename and filesystem metadata in the catalog. Do not move or rename the user's source during import. A future setting may allow an external folder to be indexed without copying.
+Future milestones can add `Inbox/`, `Transcripts/`, and `Exports/` as those workflows are implemented.
+
+Importing from the UI copies the source into the managed library by default. Preserve its original filename and available embedded recording date in the catalog. The filesystem modification time is not treated as the recording date; show an unknown-date fallback when the audio has no embedded date. Mutagen reads common media metadata, with a format-specific MP3 parser fallback for files that generic detection sees only as ID3 tags. Do not move or rename the user's source during import. A future setting may allow an external folder to be indexed without copying.
+
+The FastAPI service listens on loopback for the local React UI. It exposes health, catalog, import, audio-file, metadata-match confirmation, manual status, recording-group, transcript-version, pipeline-definition, and pipeline-run routes. Transcription status can be marked manually for legacy recordings until transcript data is linked.
+
+Confirmed recording deletion calls Send2Trash to move the managed audio file into the operating system's trash, then removes its catalog row and group memberships from SQLite. A failed trash operation leaves the catalog entry in place.
 
 ## Identity and status
 
 - Give each recording an immutable UUID.
+- Store user-created groups in SQLite (`recording_groups`) and memberships in a many-to-many join table (`group_recordings`), allowing one recording to appear in more than one group.
 - Calculate SHA-256 on import. An exact hash match identifies the same bytes even after a filename change.
 - Store size, duration, media metadata, and timestamps as supporting evidence. If the hash differs but metadata is similar, show a possible duplicate for user confirmation; metadata alone is not a definitive identity key.
 - Store status and history in SQLite: discovered, queued, transcribing, transcribed, processing, ready, failed, or needs review. Treat these as derived workflow state, not folder names.
+- In MVP1, allow a manual status source for legacy recordings whose transcript file is not imported yet; display that distinction in the details panel. Once transcript data is linked, actual transcript records become the source of derived status.
 
 ## Data model
 
-- `recording`: UUID, stored path, original name, content hash, size, duration, media metadata, group, and timestamps.
+- `recording`: UUID, stored path, original name, content hash, size, duration, media metadata, and timestamps.
+- `recording_group` and `group_recording`: named groups and their many-to-many recording memberships.
+- `raw_transcripts`: append-only plain-text transcript versions associated with a recording.
+- `pipelines`: the current editable pipeline definition and revision number.
+- `pipeline_runs`: immutable pipeline configuration snapshot and batch state.
+- `run_inputs`: frozen raw text/version used by each recording in a run.
+- `stage_runs`: per-recording stage status, input reference and text, output, provider/model, prompt and prompt hash, timestamps, and error.
 - `transcription_run`: recording UUID, provider, model, configuration, start/end time, status, and error details.
 - `transcript_version`: recording UUID, version type (raw, edited, cleaned), schema version, content, and provenance.
 - `processing_run`: stage, provider/model, prompt version, input version, output version, status, and error details.
@@ -41,12 +52,14 @@ Store raw word/segment timing as structured data. Keep edited text as a new vers
 ## Processing flow
 
 1. Discover and validate an audio file; copy it to managed storage and calculate its hash and media metadata.
-2. Add it to the catalog and queue a transcription job when requested.
-3. A persistent worker claims queued jobs, writes progress/errors to SQLite, and saves the provider's original structured response.
-4. Run selected text stages after transcription. Each stage consumes a named transcript version and stores a new version with provider, model, prompt version, and output.
-5. Export the current human-readable transcript and structured JSON. Exports can be regenerated from catalog state.
+2. Add it to the catalog. Real audio transcription is implemented in MVP3.
+3. In MVP2, save existing or fixture raw text as an append-only transcript version.
+4. Snapshot the chosen pipeline configuration and current raw input into SQLite, then queue its ordered stages on one background worker.
+5. Each stage uses either the frozen raw text or an explicitly selected earlier stage output. OpenRouter receives transcript text only when the user launches the pipeline.
+6. Save stage input/output and provider/model/prompt provenance in SQLite. Retrying a failed run skips stages already marked successful.
+7. Human-readable and structured transcript exports are planned after transcript workflows are reviewed.
 
-Use a persistent database-backed worker rather than an in-memory web request task so app restarts do not lose queued work. Start with one worker; parallelism can be added after rate limits and local resource use are understood.
+Use a persistent database-backed worker rather than an in-memory web request task so app restarts do not lose queued work. MVP2 recovers queued or interrupted runs when the service starts and uses one worker; parallelism can be added after rate limits and local resource use are understood. The OpenRouter key is read from `OPENROUTER_API_KEY` in the API process environment and is never stored in the app database.
 
 ## Transcript playback
 

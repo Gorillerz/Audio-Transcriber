@@ -6,8 +6,8 @@ Work through one milestone at a time. After each milestone, review the result, c
 
 | Milestone | Goal | Brief |
 |---|---|---|
-| MVP1 — Audio library | Build the recording catalog and visual layout, with import, filters, sorting, and a metadata side panel. | [docs/mvp/MVP1-audio-library.md](docs/mvp/MVP1-audio-library.md) |
-| MVP2 — Transcript workflows | Configure reusable processing stages and run them on one or many existing/fixture transcripts. | [docs/mvp/MVP2-transcript-workflows.md](docs/mvp/MVP2-transcript-workflows.md) |
+| MVP1 — Audio library | Build the recording catalog with import, filters, sorting, persistent groups, safe deletion, and a metadata side panel. | [docs/mvp/MVP1-audio-library.md](docs/mvp/MVP1-audio-library.md) |
+| MVP2 — Transcript workflows | Save versioned raw text, configure reusable OpenRouter stages, and run/review them on one or many recordings. | [docs/mvp/MVP2-transcript-workflows.md](docs/mvp/MVP2-transcript-workflows.md) |
 | MVP3 — Transcription and review | Connect real ASR; show progress, timed and plain transcripts, audio seeking, editing, and raw history. | [docs/mvp/MVP3-transcription-review.md](docs/mvp/MVP3-transcription-review.md) |
 
 ## Review loop

@@ -2,48 +2,51 @@
 
 ## Goal
 
-Let the user define reusable processing pipelines, connect one step's output to another step's input, and run the pipeline on one or many recordings. Use existing or fixture raw transcripts while the real transcription provider is still being selected and integrated in MVP3.
+Create reusable text-processing pipelines that can be run against saved raw transcript text for one or many recordings. Real audio-to-text transcription remains in MVP3.
 
-## Included
+## Implemented
 
-- Define, name, edit, save, and duplicate pipeline configurations.
-- Configure each step with a provider/model, prompt, input source, and expected output shape.
-- Use one step's named output as the next step's input.
-- Support stages such as raw transcript input, cleanup, cleanup verification, summary/topics, and title.
-- Run a pipeline for one recording or a selected batch.
-- Show queued/running/succeeded/failed status for each recording and stage, with retry for failures.
-- Preserve each stage output with its input reference, provider/model, prompt version, and run metadata.
-- Allow review of outputs and errors from the recording details panel.
+- Paste or edit plain-text raw transcripts from a recording details panel. Saving appends a version and preserves the earlier text.
+- Create, edit, save, and duplicate named pipeline definitions.
+- Add ordered stages and configure each stage with a type, OpenRouter model ID, prompt, input source, and text or JSON output format.
+- Bind a stage to the raw transcript or an earlier stage's named output. Forward references are rejected.
+- Run a pipeline on one recording or a batch selected from the audio library.
+- Display queued, running, succeeded, and failed status for each stage and recording, with output and errors.
+- Retry failed stages while retaining successful stage outputs.
+- Store an immutable pipeline snapshot, frozen raw input version, stage input/output, model, prompt, prompt hash, and timestamps with each run.
+- Process jobs one at a time on a background worker. Queued and interrupted runs are recovered when the local API starts.
 
-## Deferred
+## Setup and limits
 
-- Real ASR provider execution; that lands in MVP3.
-- Editing timestamped words and synchronized audio playback.
-- User-authored executable code in pipeline steps.
-- Parallel job execution until rate and resource limits are understood.
+- Set `OPENROUTER_API_KEY` in the environment used to start FastAPI before executing a provider call. The key is not stored in SQLite or source files.
+- Enter an OpenRouter model ID in each stage. Model IDs are currently free-text fields; the app does not fetch a live model catalog.
+- Stage prompts and text are sent to OpenRouter only when the user launches a pipeline. Audio is not sent to OpenRouter.
+- JSON stages request JSON mode and fail visibly if the provider returns invalid JSON.
+- MVP2 supports saved or fixture plain text. Real ASR, timestamped transcript editing, synchronized playback, and export files are deferred.
 
 ## Acceptance criteria
 
-- A saved pipeline can be applied to a single recording and a selected batch.
-- A downstream step receives the output selected in its configuration, not an implicit or stale version.
-- Every run saves its output and enough provenance to reproduce the configuration.
-- A failed stage can be retried without rerunning successful recordings or stages unnecessarily.
-- Editing a pipeline does not rewrite outputs from previous runs.
-- Fixture transcript input allows the pipeline UI and execution flow to be reviewed without an ASR provider.
+- A saved pipeline can be applied to a single recording or a selected batch with a saved raw transcript.
+- Raw transcript saves append versions, and a run uses the raw version captured at queue time.
+- A downstream stage receives exactly the raw or earlier-stage output selected in its configuration.
+- Every run preserves the pipeline revision, provider/model, prompt/hash, input reference, stage input/output, and status.
+- A failed stage can be retried without rerunning successful stages or overwriting their output.
+- Editing or duplicating a pipeline does not rewrite prior run snapshots or outputs.
+- A fixture transcript can exercise the whole workflow without an ASR provider.
 
-## Automated test checklist
+## Automated checks
 
-- Test pipeline save/load and step ordering.
-- Test input/output binding between steps.
-- Test validation for missing input, model, prompt, or output schema.
-- Test batch job state, partial failure, retry, and output provenance.
-- Test that changing a pipeline leaves prior run records intact.
+- Backend tests cover raw transcript versioning, pipeline validation and input binding, immutable run snapshots, and retry behavior that preserves successful outputs.
+- Frontend build and existing catalog helper tests run with `npm --prefix frontend run build` and `npm --prefix frontend test`.
+- Backend tests run with `py -m pytest --basetemp=backend-test-tmp` from `backend/`.
 
 ## User-run checklist
 
-- Create a pipeline with cleanup, verification, summary, and title stages.
-- Change the input binding for one stage and confirm the result uses the selected prior output.
-- Run against one fixture transcript and a batch of fixtures.
-- Confirm progress and failures are visible per item and per stage.
-- Retry one failed item and confirm successful outputs remain unchanged.
-- Edit a pipeline and confirm earlier runs retain their original configuration and outputs.
+- Set an OpenRouter key in the API process environment, restart FastAPI, and confirm no key is displayed in the UI.
+- Open a recording, paste a short fixture transcript, save it, change it, and save again; confirm earlier raw versions remain available.
+- Create a pipeline with cleanup, verification, summary, and title stages. Enter a model ID and prompt for each stage.
+- Bind a later stage to an earlier output; run once, change it to raw input, and compare the results.
+- Select one recording and then multiple recordings and run the pipeline. Watch per-stage status and inspect outputs.
+- Force a provider error (for example, an invalid model ID), fix the configuration or key, retry, and confirm completed stages retain their previous output.
+- Edit or duplicate a pipeline after a run and confirm its earlier run keeps the old pipeline revision and prompt.
+- Restart FastAPI while a run is queued or active and confirm its saved state resumes.

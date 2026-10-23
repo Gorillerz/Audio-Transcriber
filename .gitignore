@@ -9,6 +9,8 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_tmp/
+backend/backend-test-tmp/
 .mypy_cache/
 .ruff_cache/
 
@@ -16,10 +18,12 @@ __pycache__/
 node_modules/
 dist/
 build/
+*.tsbuildinfo
 
 # Local app state and private journal library
 data/
 JournalLibrary/
+.dev-library/
 *.sqlite
 *.sqlite3
 *.db
