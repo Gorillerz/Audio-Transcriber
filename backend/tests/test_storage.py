@@ -26,6 +26,39 @@ def test_import_records_hash_and_survives_catalog_reopen(tmp_path):
     assert Catalog(library).get_recording(recording["id"])["sha256"] == recording["sha256"]
 
 
+def test_reopen_repairs_a_stale_audio_path_only_for_matching_file_hash(tmp_path):
+    """Startup repairs the DB path for an existing recording without moving its audio."""
+    library = tmp_path / "library"
+    catalog = Catalog(library)
+    recording, _, _ = catalog.import_file("memo.mp3", BytesIO(b"original audio bytes"), "audio/mpeg")
+    actual_path = Path(recording["stored_path"])
+    stale_path = library / "fresh" / "Audio" / recording["id"] / "memo.mp3"
+    with catalog._connect() as connection:
+        connection.execute("UPDATE recordings SET stored_path=? WHERE id=?", (str(stale_path), recording["id"]))
+
+    reopened = Catalog(library)
+
+    assert reopened.get_recording(recording["id"])["stored_path"] == str(actual_path)
+    assert actual_path.read_bytes() == b"original audio bytes"
+    assert not stale_path.exists()
+
+
+def test_reopen_does_not_repair_path_to_a_different_audio_file(tmp_path):
+    """A same-folder candidate with different bytes cannot inherit another recording's identity."""
+    library = tmp_path / "library"
+    catalog = Catalog(library)
+    recording, _, _ = catalog.import_file("memo.mp3", BytesIO(b"original audio bytes"), "audio/mpeg")
+    actual_path = Path(recording["stored_path"])
+    actual_path.write_bytes(b"different audio bytes")
+    stale_path = library / "fresh" / "Audio" / recording["id"] / "memo.mp3"
+    with catalog._connect() as connection:
+        connection.execute("UPDATE recordings SET stored_path=? WHERE id=?", (str(stale_path), recording["id"]))
+
+    reopened = Catalog(library)
+
+    assert reopened.get_recording(recording["id"])["stored_path"] == str(stale_path)
+
+
 def test_exact_bytes_under_new_name_are_recognized_as_same_recording(tmp_path):
     """A rename does not create a second catalog row when content hash matches."""
     catalog = Catalog(tmp_path / "library")
@@ -122,3 +155,28 @@ def test_delete_moves_audio_to_trash_before_removing_catalog_entry(tmp_path, mon
     assert sent_to_trash == [recording["stored_path"]]
     assert catalog.get_recording(recording["id"]) is None
     assert not Path(recording["stored_path"]).exists()
+
+
+def test_project_library_config_pins_root_across_environment_changes(tmp_path, monkeypatch):
+    """A repository-local selection wins over shell variables and default user folders."""
+    selected = tmp_path / ".dev-library" / "fresh"
+    (selected / "Audio").mkdir(parents=True)
+    (selected / "app.sqlite").touch()
+    config = tmp_path / ".journal-library-root"
+    config.write_text(".dev-library/fresh\n", encoding="utf-8")
+    monkeypatch.setattr(storage, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(storage, "LIBRARY_ROOT_CONFIG", config)
+    monkeypatch.setenv("JOURNAL_LIBRARY_DIR", str(tmp_path / "different-library"))
+
+    assert storage.default_library_root() == selected.resolve()
+
+
+def test_missing_pinned_library_fails_instead_of_falling_back_to_empty(tmp_path, monkeypatch):
+    """A stale project path is surfaced clearly rather than silently creating another catalog."""
+    config = tmp_path / ".journal-library-root"
+    config.write_text(".dev-library/fresh\n", encoding="utf-8")
+    monkeypatch.setattr(storage, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(storage, "LIBRARY_ROOT_CONFIG", config)
+
+    with pytest.raises(RuntimeError, match="will not open a new empty library"):
+        storage.default_library_root()

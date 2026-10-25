@@ -10,8 +10,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from .audio_media import AudioMediaService
 from .storage import Catalog
-from .workflows import PipelineRunner, WorkflowStore
+from .transcription import MODEL_ID, LocalWhisper, list_transcription_models
+from .model_catalog import list_openrouter_models
+from .workflows import (
+    PipelineRunner,
+    WorkflowStore,
+    check_openrouter_key,
+    openrouter_key,
+    remove_openrouter_key,
+    save_openrouter_key,
+)
 
 app = FastAPI(title="Journal Transcriber Local API", version="0.1.0")
 app.add_middleware(
@@ -21,8 +31,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 catalog = Catalog()
+audio_media = AudioMediaService(catalog)
 workflow_store = WorkflowStore(catalog.db_path)
-pipeline_runner = PipelineRunner(workflow_store)
+local_whisper = LocalWhisper(catalog)
+pipeline_runner = PipelineRunner(workflow_store, local_whisper)
+
+
+def _attach_word_alignments(outputs: list[dict]) -> list[dict]:
+    """Attach saved Whisper scores to transcription outputs by their raw-version ID."""
+    if not outputs:
+        return outputs
+    recording_id = outputs[0]["recording_id"]
+    transcript_ids = [
+        output["source_id"] for output in outputs
+        if output["kind"] == "transcription" and output.get("source_id")
+    ]
+    alignments = workflow_store.get_transcript_word_alignments(recording_id, transcript_ids)
+    for output in outputs:
+        output["word_alignment"] = alignments.get(output.get("source_id")) if output["kind"] == "transcription" else None
+    return outputs
 
 
 class StatusUpdate(BaseModel):
@@ -50,6 +77,7 @@ class PipelineConfig(BaseModel):
     """User-authored, non-executable pipeline configuration."""
     name: str
     description: str = ""
+    initial_output_name: str = "Transcription"
     steps: list[dict]
 
 
@@ -58,10 +86,90 @@ class PipelineRunRequest(BaseModel):
     recording_ids: list[str]
 
 
+class OutputOrderRequest(BaseModel):
+    """Move a named official output one position in the details panel."""
+    direction: str
+
+
+class OutputRenameRequest(BaseModel):
+    """New visible name for one non-transcription official output."""
+    name: str
+
+
+class OutputRestoreRequest(BaseModel):
+    """Optionally rename an archived output when its former name is occupied."""
+    output_name: str | None = None
+
+
+class OpenRouterKeyRequest(BaseModel):
+    """An API key entered in Library settings; the secret is never returned."""
+    api_key: str | None = Field(default=None, max_length=500)
+
+
+class TranscriptionStart(BaseModel):
+    """Select the transcription provider for one recording."""
+    provider: str = "wsl-whisper"
+    model: str = MODEL_ID
+
+
 @app.get("/api/health")
 def health() -> dict:
     """Expose a lightweight readiness check for the frontend."""
     return {"ok": True, "library_root": str(catalog.root)}
+
+
+@app.get("/api/settings/openrouter")
+def get_openrouter_settings() -> dict:
+    """Report whether an OpenRouter key is available without exposing it."""
+    key, source = openrouter_key()
+    return {"configured": bool(key), "source": source}
+
+
+@app.get("/api/openrouter/models")
+def get_openrouter_models() -> list[dict]:
+    """Return model names, publisher labels, and per-million-token prices."""
+    try:
+        return list_openrouter_models()
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.put("/api/settings/openrouter")
+def put_openrouter_settings(request: OpenRouterKeyRequest) -> dict:
+    """Save a key in the operating system credential store, never in SQLite."""
+    secret = (request.api_key or "").strip()
+    if not secret:
+        raise HTTPException(status_code=422, detail="Enter an OpenRouter API key.")
+    try:
+        save_openrouter_key(secret)
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save the key to Windows Credential Manager. Check that credential storage is available and try again.",
+        ) from error
+    return {"configured": True, "source": "Windows Credential Manager"}
+
+
+@app.delete("/api/settings/openrouter")
+def delete_openrouter_settings() -> dict:
+    """Remove the saved key and report whether an environment fallback remains."""
+    try:
+        remove_openrouter_key()
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Could not remove the saved key from Windows Credential Manager.") from error
+    key, source = openrouter_key()
+    return {"configured": bool(key), "source": source}
+
+
+@app.post("/api/settings/openrouter/test")
+def test_openrouter_settings(request: OpenRouterKeyRequest) -> dict:
+    """Test an unsaved key, or the configured key, without returning its value."""
+    secret = request.api_key.strip() if request.api_key else None
+    if not secret:
+        secret, _ = openrouter_key()
+    if not secret:
+        raise HTTPException(status_code=400, detail="Enter or save an OpenRouter API key first.")
+    return check_openrouter_key(secret)
 
 
 @app.get("/api/recordings")
@@ -111,6 +219,125 @@ def get_raw_transcripts(recording_id: str) -> list[dict]:
     if not catalog.get_recording(recording_id):
         raise HTTPException(status_code=404, detail="Recording not found")
     return workflow_store.get_raw_transcripts(recording_id)
+
+
+@app.get("/api/recordings/{recording_id}/pipeline-runs")
+def get_recording_pipeline_runs(recording_id: str) -> list[dict]:
+    """List saved pipeline outputs for one recording, with the newest run first."""
+    if not catalog.get_recording(recording_id):
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return workflow_store.list_recording_run_outputs(recording_id)
+
+
+@app.get("/api/recordings/{recording_id}/outputs")
+def get_recording_outputs(recording_id: str) -> list[dict]:
+    """List the one current official value for each named recording output."""
+    if not catalog.get_recording(recording_id):
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return _attach_word_alignments(workflow_store.list_official_outputs(recording_id))
+
+
+@app.get("/api/recordings/{recording_id}/output-history")
+def get_recording_output_history(recording_id: str) -> list[dict]:
+    """List replaced and removed outputs that can be restored later."""
+    if not catalog.get_recording(recording_id):
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return _attach_word_alignments(workflow_store.list_output_history(recording_id))
+
+
+@app.delete("/api/recordings/{recording_id}/outputs/{output_id}")
+def archive_recording_output(recording_id: str, output_id: str) -> dict:
+    """Remove an official output by moving its full value to previous versions."""
+    archived = workflow_store.archive_official_output(recording_id, output_id)
+    if not archived:
+        raise HTTPException(status_code=404, detail="Official output not found")
+    return archived
+
+
+@app.patch("/api/recordings/{recording_id}/outputs/{output_id}/order")
+def move_recording_output(recording_id: str, output_id: str, request: OutputOrderRequest) -> list[dict]:
+    """Reorder non-transcription outputs; transcription remains pinned first."""
+    try:
+        result = workflow_store.move_official_output(recording_id, output_id, request.direction)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail="Official output not found")
+    return result
+
+
+@app.patch("/api/recordings/{recording_id}/outputs/{output_id}/name")
+def rename_recording_output(recording_id: str, output_id: str, request: OutputRenameRequest) -> dict:
+    """Rename an official stage output while reserving Transcription for ASR."""
+    try:
+        result = workflow_store.rename_official_output(recording_id, output_id, request.name)
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail="Official output not found")
+    return result
+
+
+@app.post("/api/recordings/{recording_id}/output-history/{history_id}/restore")
+def restore_recording_output(recording_id: str, history_id: str, request: OutputRestoreRequest) -> dict:
+    """Restore archived content under its old name or a user-chosen free name."""
+    try:
+        return workflow_store.restore_output(recording_id, history_id, request.output_name)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except FileExistsError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/transcription/providers")
+def get_transcription_providers(recording_id: str) -> list[dict]:
+    """List local ASR choices with live device readiness and benchmark estimates."""
+    recording = catalog.get_recording(recording_id)
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return [local_whisper.provider_info(recording.get("duration_seconds"))]
+
+
+@app.get("/api/transcription/models")
+def get_transcription_models() -> list[dict]:
+    """List supported local ASR model choices without starting a WSL probe."""
+    return list_transcription_models()
+
+
+@app.post("/api/recordings/{recording_id}/transcriptions")
+def start_recording_transcription(recording_id: str, request: TranscriptionStart) -> dict:
+    """Queue a local Whisper run and return its persistent ID for progress polling."""
+    if request.provider != "wsl-whisper":
+        raise HTTPException(status_code=422, detail="That transcription provider is not available.")
+    try:
+        return local_whisper.start(recording_id, request.model)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.get("/api/recordings/{recording_id}/transcriptions/latest")
+def get_latest_transcription(recording_id: str) -> dict | None:
+    """Return the newest transcription run so its active timer can be restored."""
+    if not catalog.get_recording(recording_id):
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return catalog.latest_transcription_run(recording_id)
+
+
+@app.get("/api/transcriptions/{run_id}")
+def get_transcription_run(run_id: str) -> dict:
+    """Return persistent state, elapsed time, and saved word-timed result for a run."""
+    run = catalog.get_transcription_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Transcription run not found")
+    return run
 
 
 @app.post("/api/recordings/{recording_id}/transcripts")
@@ -195,11 +422,13 @@ def list_pipeline_runs() -> list[dict]:
 
 
 @app.get("/api/pipeline-runs/{run_id}")
-def get_pipeline_run(run_id: str) -> dict:
+def get_pipeline_run(run_id: str, include_inputs: bool = False) -> dict:
     """Return all stage statuses, outputs, and errors for a batch run."""
     run = workflow_store.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Pipeline run not found")
+    if not include_inputs:
+        run.pop("inputs", None)
     return run
 
 
@@ -215,14 +444,43 @@ def retry_pipeline_run(run_id: str) -> dict:
 
 @app.get("/api/recordings/{recording_id}/audio")
 def get_audio(recording_id: str) -> FileResponse:
-    """Serve a local recording for future playback controls in the review panel."""
+    """Stream the unchanged source recording for playback and seeking in the review panel."""
     recording = catalog.get_recording(recording_id)
     if not recording:
         raise HTTPException(status_code=404, detail="Recording not found")
     path = Path(recording["stored_path"])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Audio file is missing from the library")
-    return FileResponse(path, media_type=recording["mime_type"] or "application/octet-stream")
+    return FileResponse(path, media_type=recording["mime_type"] or "application/octet-stream", filename=recording["original_name"], content_disposition_type="inline")
+
+
+@app.get("/api/recordings/{recording_id}/audio/playback")
+def get_browser_playback(recording_id: str) -> FileResponse:
+    """Serve a cached MP3 rendition when the browser cannot decode the original format."""
+    recording = catalog.get_recording(recording_id)
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    try:
+        path = audio_media.browser_playback_path(recording)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return FileResponse(path, media_type="audio/mpeg", filename=f"{Path(recording['original_name']).stem}.mp3", content_disposition_type="inline")
+
+
+@app.get("/api/recordings/{recording_id}/waveform")
+def get_recording_waveform(recording_id: str) -> dict:
+    """Return cached or freshly decoded amplitude peaks for the selected recording."""
+    recording = catalog.get_recording(recording_id)
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    try:
+        return audio_media.waveform(recording)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.post("/api/recordings/import")
@@ -261,9 +519,12 @@ def confirm_separate(recording_id: str) -> dict:
 @app.post("/api/recordings/{recording_id}/confirm-match/{canonical_id}")
 def confirm_match(recording_id: str, canonical_id: str) -> dict:
     """Confirm two differently encoded files belong to one catalog recording."""
+    possible_duplicate = catalog.get_recording(recording_id)
     recording = catalog.confirm_match(recording_id, canonical_id)
     if not recording:
         raise HTTPException(status_code=404, detail="Recording or possible match not found")
+    if possible_duplicate:
+        audio_media.discard(possible_duplicate)
     return recording
 
 
@@ -286,8 +547,11 @@ def delete_recordings(request: DeleteRecordings) -> dict:
     errors: list[dict[str, str]] = []
     for recording_id in dict.fromkeys(request.ids):
         try:
+            recording = catalog.get_recording(recording_id)
             if catalog.move_to_trash(recording_id):
                 deleted.append(recording_id)
+                if recording:
+                    audio_media.discard(recording)
             else:
                 errors.append({"id": recording_id, "error": "Recording not found."})
         except OSError as error:

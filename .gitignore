@@ -24,6 +24,7 @@ build/
 data/
 JournalLibrary/
 .dev-library/
+.journal-library-root
 *.sqlite
 *.sqlite3
 *.db

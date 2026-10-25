@@ -1,6 +1,6 @@
 /** Tests for catalog formatting and filter/sort behavior. */
 import { describe, expect, it } from "vitest";
-import { filterAndSort, formatDate, formatDuration } from "./catalog";
+import { alignmentMatchesTranscript, areAllBlocksCollapsed, clampPlaybackRate, confidenceColor, countWords, filterAndSort, formatDate, formatDuration, seekTarget } from "./catalog";
 import type { Recording } from "./types";
 
 const base = (id: string, name: string, seconds: number | null, status: Recording["status"]): Recording => ({
@@ -14,6 +14,49 @@ describe("catalog helpers", () => {
     expect(formatDuration(null)).toBe("—");
     expect(formatDuration(1)).toBe("1s");
     expect(formatDuration(90 * 60 + 4)).toBe("1h 30m 4s");
+  });
+
+  it("clamps seeks to the start and end of audio", () => {
+    expect(seekTarget(2, -5, 20)).toBe(0);
+    expect(seekTarget(18, 5, 20)).toBe(20);
+    expect(seekTarget(10, -5, 20)).toBe(5);
+  });
+
+  it("limits audio speed to the player range", () => {
+    expect(clampPlaybackRate(1.5)).toBe(1.5);
+    expect(clampPlaybackRate(5)).toBe(2);
+    expect(clampPlaybackRate(0.1)).toBe(0.5);
+    expect(clampPlaybackRate(Number.NaN)).toBe(1);
+  });
+
+  it("counts words in output text and treats whitespace-only text as empty", () => {
+    expect(countWords("  Bonjour,   how are you?\nI'm well. ")).toBe(6);
+    expect(countWords(" \n\t ")).toBe(0);
+  });
+
+  it("uses the requested confidence colors and interpolates between their anchors", () => {
+    expect(confidenceColor(0.25)).toBe("#ef4444");
+    expect(confidenceColor(0.5)).toBe("#f97316");
+    expect(confidenceColor(0.75)).toBe("#a3e635");
+    expect(confidenceColor(1)).toBe("#22c55e");
+    expect(confidenceColor(0.1)).toBe("#ef4444");
+    expect(confidenceColor(null)).toBeNull();
+  });
+
+  it("only applies word alignment when its exact text reconstructs the transcript", () => {
+    const words = [
+      { start: 0, end: 0.2, text: " Bonjour" },
+      { start: 0.2, end: 0.4, text: "!" },
+    ];
+    expect(alignmentMatchesTranscript("Bonjour!", words)).toBe(true);
+    expect(alignmentMatchesTranscript("Bonjour?", words)).toBe(false);
+    expect(alignmentMatchesTranscript("", [])).toBe(false);
+  });
+
+  it("reports when all output text blocks are collapsed", () => {
+    expect(areAllBlocksCollapsed(["one", "two"], new Set(["one", "two"]))).toBe(true);
+    expect(areAllBlocksCollapsed(["one", "two"], new Set(["one"]))).toBe(false);
+    expect(areAllBlocksCollapsed([], new Set())).toBe(false);
   });
 
   it("does not present the import date as a recording date", () => {

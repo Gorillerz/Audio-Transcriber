@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import uuid
@@ -16,10 +17,26 @@ from mutagen.mp3 import MP3
 from send2trash import send2trash
 
 SUPPORTED_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus", ".aac", ".wma", ".webm", ".mp4"}
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LIBRARY_ROOT_CONFIG = PROJECT_ROOT / ".journal-library-root"
 
 
 def default_library_root() -> Path:
-    """Choose a user-data directory outside the source checkout by default."""
+    """Load the pinned project library before environment and platform defaults."""
+    if LIBRARY_ROOT_CONFIG.is_file():
+        configured = LIBRARY_ROOT_CONFIG.read_text(encoding="utf-8").strip()
+        if not configured:
+            raise RuntimeError(f"The library path file is empty: {LIBRARY_ROOT_CONFIG}")
+        path = Path(configured).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        path = path.resolve()
+        if not (path / "app.sqlite").is_file() or not (path / "Audio").is_dir():
+            raise RuntimeError(
+                f"The configured library is missing or incomplete: {path}. "
+                f"Restore that folder or correct {LIBRARY_ROOT_CONFIG.name}; the app will not open a new empty library."
+            )
+        return path
     explicit = os.environ.get("JOURNAL_LIBRARY_DIR")
     if explicit:
         return Path(explicit).expanduser().resolve()
@@ -86,12 +103,122 @@ class Catalog:
                     recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
                     PRIMARY KEY(group_id, recording_id)
                 );
+                CREATE TABLE IF NOT EXISTS transcription_runs (
+                    id TEXT PRIMARY KEY,
+                    recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    device TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    error TEXT,
+                    result_json TEXT
+                );
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(recordings)")}
             if "status_source" not in columns:
                 connection.execute("ALTER TABLE recordings ADD COLUMN status_source TEXT NOT NULL DEFAULT 'derived'")
+            connection.execute(
+                "UPDATE transcription_runs SET status='failed', finished_at=?, error=? WHERE status='running'",
+                (datetime.now(timezone.utc).isoformat(), "Interrupted when the local API restarted; retry this transcription."),
+            )
+        self._repair_missing_audio_paths()
         self._backfill_missing_durations()
+
+    def _repair_missing_audio_paths(self) -> None:
+        """Repoint stale catalog paths only when a file in the managed ID folder matches its saved hash."""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id, original_name, stored_path, sha256 FROM recordings").fetchall()
+            for row in rows:
+                if Path(row["stored_path"]).is_file():
+                    continue
+                recording_dir = self.audio_dir / row["id"]
+                if not recording_dir.is_dir():
+                    continue
+                preferred_names = [Path(row["original_name"]).name, Path(row["stored_path"]).name]
+                candidates = [recording_dir / name for name in dict.fromkeys(preferred_names)]
+                try:
+                    candidates.extend(path for path in recording_dir.iterdir() if path.is_file() and path not in candidates)
+                except OSError:
+                    continue
+                for candidate in candidates:
+                    if not candidate.is_file() or self._file_sha256(candidate) != row["sha256"]:
+                        continue
+                    connection.execute("UPDATE recordings SET stored_path=? WHERE id=?", (str(candidate.resolve()), row["id"]))
+                    break
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str | None:
+        """Hash a candidate in chunks so path repair verifies identity without loading audio into memory."""
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        return digest.hexdigest()
+
+    def create_transcription_run(self, recording_id: str, provider: str, model: str, device: str) -> dict | None:
+        """Persist a queued local-ASR run before its worker starts."""
+        run_id = str(uuid.uuid4())
+        started_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            if not connection.execute("SELECT 1 FROM recordings WHERE id=?", (recording_id,)).fetchone():
+                return None
+            connection.execute(
+                "INSERT INTO transcription_runs(id,recording_id,provider,model,device,status,started_at) VALUES(?,?,?,?,?,?,?)",
+                (run_id, recording_id, provider, model, device, "running", started_at),
+            )
+        return self.get_transcription_run(run_id)
+
+    def get_transcription_run(self, run_id: str) -> dict | None:
+        """Return a saved transcription run with its latest state and result."""
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM transcription_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["result"] = json.loads(result.pop("result_json")) if result.get("result_json") else None
+        ended_at = datetime.fromisoformat(result["finished_at"]) if result["finished_at"] else datetime.now(timezone.utc)
+        result["elapsed_seconds"] = max(0.0, (ended_at - datetime.fromisoformat(result["started_at"])).total_seconds())
+        return result
+
+    def active_transcription_run(self) -> dict | None:
+        """Return the current local transcription so a second GPU job is not started."""
+        with self._connect() as connection:
+            row = connection.execute("SELECT id FROM transcription_runs WHERE status='running' ORDER BY started_at LIMIT 1").fetchone()
+        return self.get_transcription_run(row["id"]) if row else None
+
+    def latest_transcription_run(self, recording_id: str) -> dict | None:
+        """Find the newest saved ASR result or active run for a recording."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM transcription_runs WHERE recording_id=? ORDER BY started_at DESC LIMIT 1",
+                (recording_id,),
+            ).fetchone()
+        return self.get_transcription_run(row["id"]) if row else None
+
+    def get_transcription_recording_id(self, run_id: str) -> str:
+        """Resolve the recording attached to a run before persisting its transcript."""
+        with self._connect() as connection:
+            row = connection.execute("SELECT recording_id FROM transcription_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            raise KeyError("Transcription run not found.")
+        return row["recording_id"]
+
+    def finish_transcription_run(self, run_id: str, status: str, result: dict | None = None, error: str | None = None) -> dict | None:
+        """Finalize a transcription run while retaining provider output for review."""
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("A finished transcription run must succeed or fail.")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE transcription_runs SET status=?,finished_at=?,error=?,result_json=? WHERE id=?",
+                (status, datetime.now(timezone.utc).isoformat(), error, json.dumps(result) if result else None, run_id),
+            )
+        return self.get_transcription_run(run_id)
 
     def _backfill_missing_durations(self) -> None:
         """Recover durations for previously imported recordings whose metadata was unavailable."""

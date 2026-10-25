@@ -1,13 +1,22 @@
 /** Main MVP1 recording catalog, import flow, and selected-recording details panel. */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AudioLines, Check, ChevronDown, ChevronRight, CircleHelp, Clock3, FileAudio, FileUp, Filter, FolderOpen, FolderPlus, Headphones, ListFilter, LoaderCircle, Music2, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Upload, Workflow, X } from "lucide-react";
-import { addToGroup, confirmMatch, confirmSeparate, createGroup, deleteRecordings, fetchGroups, fetchRecordings, importFiles, updateStatus } from "./api";
+import { addToGroup, confirmMatch, confirmSeparate, createGroup, deleteRecordings, fetchGroups, fetchOpenRouterModels, fetchRecordings, importFiles, updateStatus } from "./api";
 import { filterAndSort, formatDate, formatDuration, type DurationFilter, type SortKey } from "./catalog";
 import type { Recording, RecordingGroup } from "./types";
 import PipelineManager from "./PipelineManager";
-import TranscriptInput from "./TranscriptInput";
+import ApiKeySettings from "./ApiKeySettings";
+import RecordingRunOutputs from "./RecordingRunOutputs";
+import TranscriptionLauncher from "./TranscriptionLauncher";
+import RecordingAudioPlayer from "./RecordingAudioPlayer";
 
 type StatusFilter = "all" | "untranscribed" | "transcribed";
+
+/** Limit the details panel to half of the space remaining beside the library. */
+function maxDetailsPanelWidth(): number {
+  const sidebarWidth = document.querySelector(".sidebar")?.getBoundingClientRect().width ?? 242;
+  return Math.max(280, Math.floor((window.innerWidth - sidebarWidth - 8) / 2));
+}
 
 /** Render the library shell and keep catalog, selection, and import feedback in sync. */
 export default function App() {
@@ -17,6 +26,8 @@ export default function App() {
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [workflowOpen, setWorkflowOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [transcriptionRecordingId, setTranscriptionRecordingId] = useState<string | null>(null);
   const [workflowRecordingIds, setWorkflowRecordingIds] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [status, setStatus] = useState<StatusFilter>("all");
@@ -32,6 +43,15 @@ export default function App() {
   const [checkedIds, setCheckedIds] = useState<string[]>([]);
   const [pendingDeleteIds, setPendingDeleteIds] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const [detailsPanelWidth, setDetailsPanelWidth] = useState(318);
+  const detailsResizeStart = useRef<{ x: number; width: number } | null>(null);
+
+  /** Keep a resized panel within the equal-width limit when the window changes size. */
+  useEffect(() => {
+    const fitPanel = () => setDetailsPanelWidth((width) => Math.min(width, maxDetailsPanelWidth()));
+    window.addEventListener("resize", fitPanel);
+    return () => window.removeEventListener("resize", fitPanel);
+  }, []);
 
   /** Load the persisted catalog so refreshing the page keeps library state. */
   const refresh = useCallback(async () => {
@@ -50,6 +70,7 @@ export default function App() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { void fetchOpenRouterModels().catch(() => undefined); }, []);
 
   /** Upload supported audio files and summarize partial errors without hiding successes. */
   const handleImport = useCallback(async (files: File[]) => {
@@ -79,6 +100,7 @@ export default function App() {
 
   const visibleRows = useMemo(() => filterAndSort(recordings.filter((row) => !activeGroupId || row.group_ids.includes(activeGroupId)), status, duration, query, sortKey, sortDirection), [recordings, activeGroupId, status, duration, query, sortKey, sortDirection]);
   const selected = recordings.find((row) => row.id === selectedId) ?? null;
+  const transcriptionRecording = recordings.find((row) => row.id === transcriptionRecordingId) ?? null;
   const possibleMatch = selected?.possible_match_id ? recordings.find((row) => row.id === selected.possible_match_id) ?? null : null;
   const totalSeconds = recordings.reduce((sum, row) => sum + (row.duration_seconds ?? 0), 0);
   const pendingCount = recordings.filter((row) => row.status === "untranscribed").length;
@@ -168,7 +190,7 @@ export default function App() {
         <div className="groups-heading"><span>GROUPS</span><button aria-label="Create group" title="Create group" onClick={() => { setCheckedIds([]); setGroupDialogOpen(true); }}><FolderPlus size={15} /></button></div>
         <nav className="nav-list group-nav" aria-label="Recording groups">{groups.map((group) => <button key={group.id} className={`nav-item ${activeGroupId === group.id ? "active" : ""}`} onClick={() => { setActiveGroupId(group.id); setStatus("all"); }}><FolderOpen size={16} /><span>{group.name}</span><span className="nav-count">{group.recording_count}</span></button>)}</nav>
         <div className="workflow-nav"><button className="nav-item" onClick={() => openWorkflows(checkedIds)}><Workflow size={17} /><span>Pipeline Workflows</span></button></div>
-        <div className="sidebar-bottom"><div className="local-card"><div className="local-icon"><ShieldCheck size={17} /></div><div><b>Stored on this device</b><span>Your recordings stay in your local library.</span></div></div><button className="settings-link"><Settings2 size={16} /> Library settings <ChevronRight size={15} /></button><div className="sidebar-footer">MVP 1.0 <span>·</span> PRIVATE BY DESIGN</div></div>
+        <div className="sidebar-bottom"><div className="local-card"><div className="local-icon"><ShieldCheck size={17} /></div><div><b>Stored on this device</b><span>Your recordings stay in your local library.</span></div></div><button className="settings-link" onClick={() => setSettingsOpen(true)}><Settings2 size={16} /> Library settings <ChevronRight size={15} /></button><div className="sidebar-footer">MVP 1.0 <span>·</span> PRIVATE BY DESIGN</div></div>
       </aside>
 
       <main className="main-area">
@@ -201,19 +223,21 @@ export default function App() {
         </div>
       </main>
 
-      {selected && <aside className="details-panel" aria-label="Recording details"><div className="details-top"><span>RECORDING DETAILS</span><button className="icon-button close-details" aria-label="Close details" onClick={() => setSelectedId(null)}><X size={18} /></button></div><div className="details-scroll"><div className="details-file-icon"><FileAudio size={23} /></div><div className="details-title"><h2 title={selected.original_name}>{selected.original_name}</h2><span>{selected.extension.replace(".", "").toUpperCase()} AUDIO FILE</span></div><StatusPill recording={selected} large />
+      {selected && <div className="details-panel-resizer" role="separator" aria-label="Resize recording details panel" aria-orientation="vertical" aria-valuemin={280} aria-valuemax={maxDetailsPanelWidth()} aria-valuenow={detailsPanelWidth} tabIndex={0} onPointerDown={(event) => { detailsResizeStart.current = { x: event.clientX, width: detailsPanelWidth }; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={(event) => { if (!detailsResizeStart.current) return; setDetailsPanelWidth(Math.max(280, Math.min(maxDetailsPanelWidth(), detailsResizeStart.current.width + detailsResizeStart.current.x - event.clientX))); }} onPointerUp={(event) => { detailsResizeStart.current = null; event.currentTarget.releasePointerCapture(event.pointerId); }} onKeyDown={(event) => { if (event.key === "ArrowLeft") setDetailsPanelWidth((width) => Math.min(maxDetailsPanelWidth(), width + 20)); if (event.key === "ArrowRight") setDetailsPanelWidth((width) => Math.max(280, width - 20)); }} />}
+      {selected && <aside className="details-panel" style={{ "--details-panel-width": `${detailsPanelWidth}px` } as React.CSSProperties} aria-label="Recording details"><div className="details-top"><span>RECORDING DETAILS</span><button className="icon-button close-details" aria-label="Close details" onClick={() => setSelectedId(null)}><X size={18} /></button></div><div className="details-scroll">
+        <div className="details-section"><div className="section-label">FILE INFORMATION</div><DetailRow label="File name" value={selected.original_name} /><DetailRow label="Duration" value={formatDuration(selected.duration_seconds)} /><DetailRow label="Date recorded" value={formatDate(selected.media_date)} /><DetailRow label="File size" value={formatBytes(selected.size_bytes)} /><DetailRow label="Format" value={selected.extension.replace(".", "").toUpperCase()} /><DetailRow label="Date added" value={new Date(selected.imported_at).toLocaleString()} /><div className="details-file-identity"><div className="hash-label">CONTENT FINGERPRINT</div><code className="hash-value">{selected.sha256.slice(0, 22)}…</code>{selected.aliases?.length ? <div className="alias-list"><div className="hash-label">CONFIRMED FILE NAMES</div>{selected.aliases.map((alias) => <div className="alias-item" key={alias.sha256}><Check size={13} /> {alias.original_name}</div>)}</div> : null}</div></div>
         {possibleMatch && <div className="match-card"><div className="match-title"><CircleHelp size={16} /><b>Possible match</b></div><p>This file resembles <strong>{possibleMatch.original_name}</strong> by size and duration. Confirm whether they’re the same recording.</p><div className="match-actions"><button onClick={() => void resolvePossibleMatch(true)}>Same recording</button><button onClick={() => void resolvePossibleMatch(false)}>Keep separate</button></div></div>}
-        <div className="details-section"><div className="section-label">FILE INFORMATION</div><DetailRow label="Duration" value={formatDuration(selected.duration_seconds)} /><DetailRow label="Date recorded" value={formatDate(selected.media_date)} /><DetailRow label="File size" value={formatBytes(selected.size_bytes)} /><DetailRow label="Format" value={selected.extension.replace(".", "").toUpperCase()} /><DetailRow label="Date added" value={new Date(selected.imported_at).toLocaleString()} /></div>
-        <div className="details-section"><div className="section-label">PROCESSING</div><div className="process-empty"><div className="process-empty-icon"><AudioLines size={17} /></div><div><b>{selected.status === "transcribed" ? "Already transcribed" : "No transcription yet"}</b><span>{selected.status_source === "manual" ? "Status marked by you. The transcript file has not been imported." : "Transcription details will appear here when available."}</span></div></div></div>
-        <TranscriptInput recordingId={selected.id} />
-        <div className="details-section"><div className="section-label">FILE IDENTITY</div><div className="hash-label">CONTENT FINGERPRINT</div><code className="hash-value">{selected.sha256.slice(0, 22)}…</code>{selected.aliases?.length ? <div className="alias-list"><div className="hash-label">CONFIRMED FILE NAMES</div>{selected.aliases.map((alias) => <div className="alias-item" key={alias.sha256}><Check size={13} /> {alias.original_name}</div>)}</div> : null}</div>
-      </div><div className="details-bottom"><button className="detail-action" onClick={() => void changeStatus(selected.status === "transcribed" ? "untranscribed" : "transcribed")}><Check size={16} />{selected.status === "transcribed" ? "Mark not transcribed" : "Mark as already transcribed"}</button><button className="detail-action" onClick={() => openWorkflows([selected.id])}><Workflow size={16} /> Run Pipeline</button><button className="detail-action" onClick={() => setPendingDeleteIds([selected.id])}><Trash2 size={16} /> Move to Recycle Bin</button><button className="detail-action" disabled title="Available in a later MVP"><Headphones size={16} /> Play recording <span>SOON</span></button><button className="detail-action" disabled title="Available in a later MVP"><AudioLines size={16} /> Start transcription <span>SOON</span></button></div></aside>}
+        <RecordingAudioPlayer recording={selected} />
+        <RecordingRunOutputs recordingId={selected.id} />
+      </div><div className="details-bottom"><button className="detail-action" onClick={() => void changeStatus(selected.status === "transcribed" ? "untranscribed" : "transcribed")}><Check size={16} />{selected.status === "transcribed" ? "Mark not transcribed" : "Mark as already transcribed"}</button><button className="detail-action" onClick={() => openWorkflows([selected.id])}><Workflow size={16} /> Run Pipeline</button><button className="detail-action" onClick={() => setPendingDeleteIds([selected.id])}><Trash2 size={16} /> Move to Recycle Bin</button><button className="detail-action" onClick={() => setTranscriptionRecordingId(selected.id)}><AudioLines size={16} /> Start transcription</button></div></aside>}
 
       {pendingDeleteIds.length > 0 && <div className="confirm-overlay" role="presentation"><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><div className="confirm-icon"><Trash2 size={20} /></div><h2 id="delete-title">Move {pendingDeleteIds.length === 1 ? "recording" : `${pendingDeleteIds.length} recordings`} to the Recycle Bin?</h2><p>The selected audio {pendingDeleteIds.length === 1 ? "file will" : "files will"} be moved to your computer’s Recycle Bin. You can restore {pendingDeleteIds.length === 1 ? "it" : "them"} from there.</p><div className="confirm-actions"><button className="quiet-button" onClick={() => setPendingDeleteIds([])}>Cancel</button><button className="confirm-delete" onClick={() => void confirmDelete()}><Trash2 size={15} /> Move to Recycle Bin</button></div></section></div>}
 
       {groupDialogOpen && <div className="confirm-overlay" role="presentation"><section className="confirm-dialog group-dialog" role="dialog" aria-modal="true" aria-labelledby="group-title"><div className="confirm-icon group-icon"><FolderPlus size={20} /></div><h2 id="group-title">Add {checkedIds.length ? `${checkedIds.length} recording${checkedIds.length === 1 ? "" : "s"} to a group` : "a group"}</h2><label className="group-name-field">New group name<input autoFocus value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="For example, Travel" onKeyDown={(event) => { if (event.key === "Enter" && groupName.trim()) void saveNewGroup(); }} /></label><button className="confirm-delete create-group-button" disabled={!groupName.trim()} onClick={() => void saveNewGroup()}><FolderPlus size={15} /> Create group{checkedIds.length ? " and add recordings" : ""}</button>{groups.length > 0 && <><div className="group-picker-label">OR ADD TO AN EXISTING GROUP</div><div className="group-picker-list">{groups.map((group) => <button key={group.id} onClick={() => void addCheckedToGroup(group)} disabled={checkedIds.length === 0}><span><FolderOpen size={15} />{group.name}</span><span>{group.recording_count} <ChevronRight size={14} /></span></button>)}</div></>}<div className="confirm-actions"><button className="quiet-button" onClick={() => { setGroupDialogOpen(false); setGroupName(""); }}>Cancel</button></div></section></div>}
 
       <PipelineManager open={workflowOpen} recordingIds={workflowRecordingIds} onClose={() => { setWorkflowOpen(false); setWorkflowRecordingIds([]); }} />
+      <ApiKeySettings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      {transcriptionRecording && <TranscriptionLauncher recording={transcriptionRecording} onClose={() => setTranscriptionRecordingId(null)} onComplete={() => { void refresh(); }} />}
 
       {dragging && <div className="drop-overlay"><div className="drop-card"><div><FileUp size={30} /></div><h2>Drop recordings to import</h2><p>Your files will be copied to the local library.</p></div></div>}
     </div>

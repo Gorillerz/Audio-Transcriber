@@ -1,5 +1,9 @@
 # MVP1 — Audio library
 
+## Status
+
+Complete. The library, import flow, filters, sorting, groups, recycle-bin deletion, and recording details panel are implemented. Audio playback and transcription are deferred to MVP3.
+
 ## Goal
 
 Create the first useful screen: a catalog of audio recordings with a clear selection and metadata view. Keep the layout easy to adjust before adding transcription workflows.
@@ -18,7 +22,7 @@ Create the first useful screen: a catalog of audio recordings with a clear selec
 - Create named recording groups, add selected recordings to new or existing groups, and filter the catalog from the sidebar by group.
 - Display assigned group names in the table, or a dash when a recording has no group.
 - Move one recording or a selected batch to the operating system trash after a warning and confirmation.
-- Select a row and show a right-side details panel with available file metadata and processing status/history.
+- Select a row and show a right-side details panel with File Information (including the filename) followed by saved pipeline outputs. Keep the table as the place to compare transcription status; omit the separate status header and Processing block.
 - Show a useful empty state and import errors.
 - Keep audio and generated library data outside the source repository by default.
 
@@ -27,7 +31,7 @@ Create the first useful screen: a catalog of audio recordings with a clear selec
 - Transcription and text-model calls.
 - Word-level transcript editing.
 - Continuous folder watching.
-- The audio player can be added after the initial layout review or in MVP3 with transcript synchronization.
+- Audio playback is deferred to MVP3 so it can be reviewed alongside timed transcripts.
 
 ## Acceptance criteria
 
@@ -38,22 +42,19 @@ Create the first useful screen: a catalog of audio recordings with a clear selec
 - Duration and embedded recording date display use audio metadata and show a clear fallback when absent; file import time is shown separately in details.
 - Filters and sorting can be combined without losing the selected row unexpectedly.
 - Selecting a recording shows its metadata in the side panel; selecting another updates the panel.
+- The side panel begins with File Information and the filename, has no duplicate file icon/status header or Processing section, and shows saved Pipeline Outputs below. The raw transcript input editor is not part of this panel.
 - The untranscribed hue is subtle and status remains understandable without color.
 - Reopening the app preserves the catalog.
+- If a saved audio path is stale after a library-root layout change, startup repairs it only when the audio under `Audio/<recording-id>/` matches the catalog content hash; the audio itself is not moved.
 - Manually marking a legacy recording as transcribed persists across refresh and can be corrected.
 - Group definitions and memberships persist across refresh; group sidebar counts match their current members.
 - Confirming deletion moves source audio to the operating system trash and removes the recording from the catalog; a failed move keeps its catalog entry.
 
-## Automated test checklist
+## Automated coverage
 
-- Test supported and unsupported import behavior.
-- Test display metadata fallbacks and duration formatting.
-- Test filtering by status and duration, including combined filters.
-- Test sorting for every displayed column.
-- Test selection updates the details panel.
-- Test persistence across application restart at the storage layer.
-- Test group creation, membership persistence, and group counts.
-- Test that successful trash moves remove catalog rows and failed moves retain them.
+- Backend tests cover catalog persistence, exact-byte duplicate detection across filename changes, unsupported formats, WAV/MP3 duration metadata, explicit metadata-match confirmation, manual status correction, and successful trash moves.
+- Frontend helper tests cover duration formatting, unknown recording dates, combined status/duration filtering, and sorting by name, embedded date, and numeric duration.
+- Group workflows, selection/details-panel interaction, every table sort direction, and failed trash moves remain manual checks rather than dedicated automated tests.
 
 ## User-run checklist
 
@@ -62,6 +63,7 @@ Create the first useful screen: a catalog of audio recordings with a clear selec
 - Filter to untranscribed recordings, under 10 minutes, and over 40 minutes; combine filters.
 - Sort each column in both directions.
 - Select several rows and confirm the side panel follows the selection.
+- Confirm the side panel shows the filename inside File Information, no top file icon or Transcribed badge, no Processing or Raw Transcript Input sections, and the saved Pipeline Outputs section.
 - Mark one known legacy recording as transcribed, filter by each status, and correct the status again.
 - Close and reopen the app and confirm imported recordings remain listed.
 - Select multiple recordings, create a named group, and confirm it appears in the sidebar with the right count.
